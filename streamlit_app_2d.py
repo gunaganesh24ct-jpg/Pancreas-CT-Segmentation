@@ -1,139 +1,267 @@
-import streamlit as st
-import numpy as np
-import tensorflow as tf
-import cv2
-import matplotlib.pyplot as plt
-import tempfile
+
 import os
+from pathlib import Path
 
-st.set_page_config(page_title="Pancreas Health Screener", layout="wide")
+import cv2
+import numpy as np
+import streamlit as st
+import tensorflow as tf
+from PIL import Image
+from tensorflow.keras.models import load_model
 
-def normalize_image(image):
-    return image.astype(np.float32) / 255.0
 
-class SegmentationAnalyzer:
-    def analyze(self, image, prediction):
-        pred_binary = prediction > 0.5
-        pred_area = np.sum(pred_binary)
-        coverage = (pred_area / image.size) * 100
-        image_region = image[pred_binary]
-        variance = np.var(image_region) if len(image_region) > 0 else 0
-        
-        risk_score = 0
-        flags = []
-        
-        if coverage < 5:
-            flags.append("🔴 Very low segmentation coverage")
-            risk_score += 2
-        elif coverage > 60:
-            flags.append("🟡 High segmentation coverage")
-            risk_score += 1
-        
-        if variance > 0.3:
-            flags.append("🟡 High pixel variance")
-            risk_score += 1
-        
-        if risk_score >= 3:
-            risk_level = "🔴 HIGH RISK"
-        elif risk_score >= 1:
-            risk_level = "🟡 MODERATE RISK"
-        else:
-            risk_level = "🟢 LOW RISK"
-        
-        return {
-            'pred_area': pred_area,
-            'coverage': coverage,
-            'variance': variance,
-            'risk_level': risk_level,
-            'risk_score': risk_score,
-            'flags': flags if flags else ["✓ Normal"]
-        }
-
-@st.cache_resource
-def load_model():
-    model_path = './models/pancreas_2d_unet.h5'
-    if os.path.exists(model_path):
-        return tf.keras.models.load_model(model_path)
-    return None
+# -----------------------------
+# Page configuration
+# -----------------------------
+st.set_page_config(
+    page_title="Pancreas Health Screener",
+    page_icon="🏥",
+    layout="wide"
+)
 
 st.title("🏥 Pancreas Health Screener")
-st.markdown("**2D U-Net Medical Image Segmentation**")
-st.markdown("---")
+st.subheader("2D U-Net Medical Image Segmentation")
 
-model = load_model()
+st.write(
+    "Upload a 2D CT image to generate a segmentation prediction "
+    "using your trained U-Net model."
+)
 
-if model is None:
+
+# -----------------------------
+# Find the trained model
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "models"
+
+MODEL_EXTENSIONS = {".h5", ".hdf5", ".keras"}
+
+
+def find_model():
+    if not MODEL_DIR.exists():
+        return None
+
+    model_files = [
+        path for path in MODEL_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in MODEL_EXTENSIONS
+    ]
+
+    if not model_files:
+        return None
+
+    # Prefer .h5 files if multiple models are present.
+    model_files.sort(
+        key=lambda path: (
+            path.suffix.lower() != ".h5",
+            path.name.lower()
+        )
+    )
+
+    return model_files[0]
+
+
+@st.cache_resource
+def load_trained_model(model_path):
+    return load_model(model_path, compile=False)
+
+
+model_file = find_model()
+model = None
+
+if model_file is None:
     st.error("❌ Model not found!")
+    st.info(
+        "Place your trained .h5 model inside the models folder "
+        "and push that folder to GitHub."
+    )
+    st.code(
+        "pancreas-ct-segmentation/\n"
+        "├── streamlit_app_2d.py\n"
+        "├── requirements.txt\n"
+        "└── models/\n"
+        "    └── your_model.h5"
+    )
     st.stop()
 
-st.success("✓ Model loaded")
-
-st.subheader("📤 Upload Medical Image")
-uploaded_file = st.file_uploader("Upload PNG image", type=['png', 'jpg', 'jpeg'])
-
-if uploaded_file is None:
-    st.info("👈 Upload an image")
+try:
+    model = load_trained_model(str(model_file))
+    st.success(f"✅ Model loaded: {model_file.name}")
+except Exception as error:
+    st.error("❌ The model file was found but could not be loaded.")
+    st.code(str(error))
     st.stop()
 
-st.subheader("⏳ Processing...")
-progress = st.progress(0)
 
-with tempfile.TemporaryDirectory() as tmpdir:
-    temp_path = os.path.join(tmpdir, 'temp.png')
-    with open(temp_path, 'wb') as f:
-        f.write(uploaded_file.getbuffer())
-    
-    progress.progress(20)
-    image = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
-    original_shape = image.shape
-    
-    progress.progress(40)
-    image_resized = cv2.resize(image, (192, 192))
-    image_normalized = normalize_image(image_resized)
-    
-    progress.progress(60)
-    input_batch = image_normalized[np.newaxis, ..., np.newaxis]
-    prediction = model.predict(input_batch, verbose=0)
-    segmentation = prediction[0, :, :, 0]
-    
-    progress.progress(80)
-    analyzer = SegmentationAnalyzer()
-    results = analyzer.analyze(image_normalized, segmentation)
-    progress.progress(100)
+# -----------------------------
+# Display model input information
+# -----------------------------
+st.write("Model input shape:", model.input_shape)
+st.write("Model output shape:", model.output_shape)
 
-st.success("✓ Complete")
-st.markdown("---")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Area", f"{results['pred_area']} px")
-with col2:
-    st.metric("Coverage", f"{results['coverage']:.1f}%")
-with col3:
-    st.metric("Variance", f"{results['variance']:.3f}")
+# -----------------------------
+# Image preprocessing
+# -----------------------------
+def preprocess_image(image, model):
+    """
+    Resize a grayscale CT image to the model's expected
+    spatial input dimensions.
 
-st.markdown("---")
-st.markdown(f"### {results['risk_level']}")
-st.write(f"Score: {results['risk_score']:.1f}")
+    This assumes a single-channel 2D U-Net input.
+    """
+    input_shape = model.input_shape
 
-st.subheader("Flags")
-for flag in results['flags']:
-    st.write(flag)
+    if isinstance(input_shape, list):
+        raise ValueError(
+            "This app expects a model with a single input."
+        )
 
-st.markdown("---")
-st.subheader("Visualization")
+    if len(input_shape) != 4:
+        raise ValueError(
+            f"Expected a 2D image model with 4 input dimensions; "
+            f"received {input_shape}."
+        )
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-axes[0].imshow(image_normalized, cmap='gray')
-axes[0].set_title("Image")
-axes[0].axis('off')
-axes[1].imshow(segmentation, cmap='RdYlGn')
-axes[1].set_title("Mask")
-axes[1].axis('off')
-axes[2].imshow(image_normalized, cmap='gray')
-axes[2].imshow(segmentation, cmap='Reds', alpha=0.6)
-axes[2].set_title("Overlay")
-axes[2].axis('off')
-st.pyplot(fig)
+    height = input_shape[1] or 256
+    width = input_shape[2] or 256
+    channels = input_shape[3]
 
-st.info("⚠️ Educational tool only")
+    if channels not in (1, None):
+        raise ValueError(
+            f"This app expects a grayscale model, but the model "
+            f"expects {channels} channels."
+        )
+
+    gray = np.array(image.convert("L"))
+
+    resized = cv2.resize(
+        gray,
+        (int(width), int(height)),
+        interpolation=cv2.INTER_AREA
+    )
+
+    # Common normalization for grayscale images.
+    normalized = resized.astype(np.float32) / 255.0
+
+    # Shape: (1, height, width, 1)
+    batch = normalized[np.newaxis, ..., np.newaxis]
+
+    return batch, resized
+
+
+# -----------------------------
+# Segmentation prediction
+# -----------------------------
+def generate_prediction(image_array, model):
+    prediction = model.predict(image_array, verbose=0)
+
+    # Handle a single-image output.
+    if isinstance(prediction, list):
+        prediction = prediction[0]
+
+    prediction = np.asarray(prediction)
+
+    if prediction.ndim == 4:
+        prediction = prediction[0]
+
+    if prediction.ndim == 3 and prediction.shape[-1] == 1:
+        prediction = prediction[..., 0]
+
+    # Binary segmentation: threshold probabilities.
+    # Multiclass segmentation: choose the class with the
+    # highest predicted probability.
+    if prediction.ndim == 2:
+        mask = (prediction >= 0.5).astype(np.uint8)
+    elif prediction.ndim == 3:
+        mask = np.argmax(prediction, axis=-1).astype(np.uint8)
+    else:
+        raise ValueError(
+            f"Unexpected model output shape: {prediction.shape}"
+        )
+
+    return prediction, mask
+
+
+# -----------------------------
+# Upload CT image
+# -----------------------------
+st.divider()
+st.header("📤 Upload CT Image")
+
+uploaded_file = st.file_uploader(
+    "Choose a 2D CT image",
+    type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
+)
+
+if uploaded_file is not None:
+    try:
+        image = Image.open(uploaded_file).convert("L")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Original CT Image")
+            st.image(image, use_container_width=True)
+
+        with st.spinner("Generating segmentation..."):
+            image_array, resized_image = preprocess_image(
+                image, model
+            )
+            prediction, mask = generate_prediction(
+                image_array, model
+            )
+
+        with col2:
+            st.subheader("Predicted Segmentation")
+            st.image(
+                mask,
+                caption="Model prediction mask",
+                clamp=True,
+                use_container_width=True
+            )
+
+        # Overlay the predicted mask on the resized CT image.
+        display_mask = (
+            mask > 0
+        ).astype(np.uint8) * 255
+
+        overlay = cv2.cvtColor(
+            resized_image, cv2.COLOR_GRAY2RGB
+        )
+
+        overlay[display_mask > 0] = [255, 0, 0]
+
+        st.subheader("CT Image with Segmentation Overlay")
+        st.image(
+            overlay,
+            caption="Red indicates pixels classified as foreground",
+            use_container_width=True
+        )
+
+        # Allow downloading the prediction.
+        mask_image = Image.fromarray(display_mask)
+
+        from io import BytesIO
+
+        buffer = BytesIO()
+        mask_image.save(buffer, format="PNG")
+
+        st.download_button(
+            label="⬇️ Download Segmentation Mask",
+            data=buffer.getvalue(),
+            file_name="pancreas_segmentation.png",
+            mime="image/png"
+        )
+
+    except Exception as error:
+        st.error("Unable to process this image.")
+        st.exception(error)
+
+else:
+    st.info("Upload a 2D CT image to start segmentation.")
+
+st.divider()
+st.caption(
+    "Educational demonstration only. Predictions are not a "
+    "medical diagnosis and must not guide treatment decisions."
+)
